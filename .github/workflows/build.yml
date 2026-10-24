@@ -1,0 +1,264 @@
+name: Build Auto Gacha Mod
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      - name: Generate project files
+        run: |
+          mkdir -p src/main/java/com/gacha src/main/resources
+
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'auto-gacha'
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          minecraft_version=1.21.11
+          yarn_mappings=1.21.11+build.4
+          loader_version=0.18.1
+          fabric_version=0.141.1+1.21.11
+          mod_version=1.0.0
+          maven_group=com.gacha
+          archives_base_name=auto-gacha
+          EOF
+
+          cat > build.gradle << 'EOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json << 'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "autogacha",
+            "version": "${version}",
+            "name": "Auto Gacha",
+            "description": "Auto klik kanan pakai Ominous Trial Key ke Ominous Vault saat vault nampilin Heavy Core. Toggle: /gacha",
+            "authors": ["you"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.gacha.GachaClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.18.1",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/java/com/gacha/GachaClient.java << 'EOF'
+          package com.gacha;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.minecraft.block.BlockState;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.block.VaultBlock;
+          import net.minecraft.block.entity.BlockEntity;
+          import net.minecraft.block.entity.VaultBlockEntity;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.entity.player.PlayerInventory;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.ActionResult;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.hit.BlockHitResult;
+          import net.minecraft.util.hit.HitResult;
+          import net.minecraft.util.math.BlockPos;
+
+          public class GachaClient implements ClientModInitializer {
+
+              // Jarak maksimal (block) dari mata pemain ke titik yang dilihat di vault
+              private static final double RANGE = 2.0;
+              // Klik tiap berapa tick (20 tick = 1 detik). 2 = 10 klik per detik
+              private static final int CLICK_INTERVAL = 2;
+
+              private boolean enabled = true;
+              private int cooldown = 0;
+              private int prevSlot = -1;
+
+              @Override
+              public void onInitializeClient() {
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                      dispatcher.register(ClientCommandManager.literal("gacha").executes(ctx -> {
+                          enabled = !enabled;
+                          cooldown = 0;
+                          ctx.getSource().sendFeedback(Text.literal("Auto Gacha: " + (enabled ? "NYALA" : "MATI")));
+                          return 1;
+                      }))
+                  );
+
+                  ClientTickEvents.END_CLIENT_TICK.register(this::tick);
+              }
+
+              private void tick(MinecraftClient mc) {
+                  ClientPlayerEntity player = mc.player;
+                  if (player == null || mc.world == null || mc.interactionManager == null) {
+                      prevSlot = -1;
+                      return;
+                  }
+                  if (!enabled || mc.currentScreen != null) {
+                      restoreSlot(player);
+                      return;
+                  }
+
+                  // 1. Harus menghadap blok
+                  if (!(mc.crosshairTarget instanceof BlockHitResult hit) || hit.getType() != HitResult.Type.BLOCK) {
+                      restoreSlot(player);
+                      return;
+                  }
+
+                  // 2. Blok yang dilihat harus Ominous Vault
+                  BlockPos pos = hit.getBlockPos();
+                  BlockState state = mc.world.getBlockState(pos);
+                  if (!state.isOf(Blocks.VAULT) || !state.get(VaultBlock.OMINOUS)) {
+                      restoreSlot(player);
+                      return;
+                  }
+
+                  // 3. Jarak maksimal 2 block
+                  if (player.getEyePos().distanceTo(hit.getPos()) > RANGE) {
+                      restoreSlot(player);
+                      return;
+                  }
+
+                  // 4. Vault harus berstatus ACTIVE (siap dibuka)
+                  var vaultState = state.get(VaultBlock.VAULT_STATE);
+                  if (!vaultState.name().equals("ACTIVE")) {
+                      restoreSlot(player);
+                      return;
+                  }
+
+                  // 5. Item yang ditampilkan vault harus Heavy Core
+                  BlockEntity be = mc.world.getBlockEntity(pos);
+                  if (!(be instanceof VaultBlockEntity vault)) {
+                      restoreSlot(player);
+                      return;
+                  }
+                  ItemStack display = vault.getSharedData().getDisplayItem();
+                  if (!display.isOf(Items.HEAVY_CORE)) {
+                      restoreSlot(player);
+                      return;
+                  }
+
+                  // 6. Harus punya Ominous Trial Key di hotbar
+                  PlayerInventory inv = player.getInventory();
+                  int keySlot = -1;
+                  for (int i = 0; i < 9; i++) {
+                      if (inv.getStack(i).isOf(Items.OMINOUS_TRIAL_KEY)) {
+                          keySlot = i;
+                          break;
+                      }
+                  }
+                  if (keySlot < 0) {
+                      restoreSlot(player);
+                      return;
+                  }
+
+                  // Pindah ke slot key kalau belum
+                  if (inv.getSelectedSlot() != keySlot) {
+                      if (prevSlot < 0) prevSlot = inv.getSelectedSlot();
+                      inv.setSelectedSlot(keySlot);
+                  }
+
+                  // Klik kanan cepat
+                  if (cooldown > 0) {
+                      cooldown--;
+                      return;
+                  }
+                  ActionResult result = mc.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
+                  if (result.isAccepted()) {
+                      player.swingHand(Hand.MAIN_HAND);
+                  }
+                  cooldown = CLICK_INTERVAL;
+              }
+
+              private void restoreSlot(ClientPlayerEntity player) {
+                  if (prevSlot >= 0) {
+                      player.getInventory().setSelectedSlot(prevSlot);
+                      prevSlot = -1;
+                  }
+                  cooldown = 0;
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-gacha
+          path: build/libs/auto-gacha-*.jar
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: auto-gacha-v${{ github.run_number }}
+          name: Auto Gacha v${{ github.run_number }}
+          files: build/libs/auto-gacha-*.jar
